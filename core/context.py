@@ -297,17 +297,35 @@ class ContextService:
         if not plugin:
             return None
 
-        # 调用插件接口
-        if hasattr(plugin, 'get_life_context'):
-            try: 
-                raw_data = await plugin.get_life_context()
-                
-                if isinstance(raw_data, dict):
-                    return self._parse_life_data(raw_data)
-                
-            except Exception as e: 
-                logger.warning(f"[上下文] Life Scheduler 方法调用出错: {e}")
-        
+        # 直接访问 life_scheduler 的 data_mgr 获取今日数据
+        try:
+            import datetime as _dt
+            data_mgr = getattr(plugin, 'data_mgr', None)
+            if data_mgr is None:
+                logger.debug("[上下文] life_scheduler 没有 data_mgr 属性")
+                return None
+
+            schedule_data = data_mgr.get(_dt.datetime.now())
+            if not schedule_data or schedule_data.status == "failed":
+                return None
+
+            # 将 ScheduleData 转为自然语言
+            parts = []
+            if schedule_data.outfit:
+                parts.append(f"【今日穿搭】{schedule_data.outfit}")
+            if getattr(schedule_data, 'outfit_style', ''):
+                parts.append(f"【穿搭风格】{schedule_data.outfit_style}")
+            if schedule_data.schedule:
+                parts.append(f"【今日日程】\n{schedule_data.schedule}")
+
+            if parts:
+                result = "\n".join(parts)
+                logger.info(f"[上下文] 成功获取 life_scheduler 数据: {result[:80]}...")
+                return result
+
+        except Exception as e:
+            logger.warning(f"[上下文] Life Scheduler 数据读取出错: {e}")
+
         return None
 
     def _parse_life_data(self, data: dict) -> str:

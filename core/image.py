@@ -257,7 +257,7 @@ class ImageService:
         self._last_image_description = prompt
         
         # 5. 调用插件生成
-        return await self._call_aiimg(prompt, use_ref=use_gitee_ref, involves_self=involves_self)
+        return await self._call_aiimg(prompt, use_ref=use_gitee_ref, involves_self=involves_self, life_context=life_context)
 
     async def _assemble_final_prompt(self, content: str, sharing_type: SharingType, involves_self: bool, visuals: Dict) -> str:
         prompts = []
@@ -352,10 +352,11 @@ class ImageService:
 
     # ==================== 4. 工具函数 ====================
 
-    async def generate_video_from_image(self, image_path: str, content: str, is_scheduled: bool = True) -> Optional[str]:
+    async def generate_video_from_image(self, image_path: str, content: str, is_scheduled: bool = True, life_context: str = None) -> Optional[str]:
         """图片转视频
         Args:
-            is_scheduled: True=定时分享触发（优先AI配图），False=聊天触发（优先外部目录最新图）
+            is_scheduled: True=定时分享触发（优先AI配图），False=聊天触发（优先参考图自拍）
+            life_context: 生活日程上下文（含穿搭等信息）
         """
         if not self.img_conf.get("enable_ai_video", False): return None
 
@@ -393,27 +394,22 @@ class ImageService:
                         if image_bytes:
                             logger.info(f"[DailySharing] [分享] 降级使用外部目录最新图片 ({len(image_bytes)} bytes)")
             else:
-                # 聊天触发：优先外部目录最新图 → 自拍参考图 → AI 配图
-                video_ref_dir = self.img_conf.get("video_ref_image_dir", "").strip()
-                if video_ref_dir and os.path.isdir(video_ref_dir):
-                    image_bytes = self._load_latest_image_from_dir(video_ref_dir)
-                    if image_bytes:
-                        logger.info(f"[DailySharing] [聊天] 使用外部目录最新图片生成视频 ({len(image_bytes)} bytes)")
-
-                if not image_bytes:
-                    use_selfie = self.img_conf.get("use_gitee_selfie_ref", False)
-                    if use_selfie:
-                        ref_images = await self._get_gitee_reference_images()
-                        if ref_images:
-                            image_bytes = ref_images[0]
-                            logger.info(f"[DailySharing] [聊天] 使用自拍参考图生成视频 ({len(image_bytes)} bytes)")
-
-                if not image_bytes:
-                    if not os.path.exists(image_path): return None
+                # 聊天触发：1.AI配图（参考图自拍）→ 2.外部目录 → 3.文生视频（无图）
+                if os.path.exists(image_path):
                     with open(image_path, "rb") as f: image_bytes = f.read()
-                    logger.info(f"[DailySharing] [聊天] 降级使用 AI 配图生成视频")
+                    logger.info(f"[DailySharing] [聊天] 使用 AI 配图（参考图自拍）生成视频")
 
-            # 构建视频提示词（上下文文案 + 图片描述 + 可选音色/语言）
+                if not image_bytes:
+                    video_ref_dir = self.img_conf.get("video_ref_image_dir", "").strip()
+                    if video_ref_dir and os.path.isdir(video_ref_dir):
+                        image_bytes = self._load_latest_image_from_dir(video_ref_dir)
+                        if image_bytes:
+                            logger.info(f"[DailySharing] [聊天] 降级使用外部目录最新图片生成视频 ({len(image_bytes)} bytes)")
+
+                if not image_bytes:
+                    logger.info("[DailySharing] [聊天] 无可用图片，将使用文生视频模式")
+
+            # 构建视频提示词（上下文文案 + 图片描述 + 穿搭 + 可选音色/语言）
             img_desc = self._last_image_description or ""
             context_hint = (content or "")[:200].strip()
             use_japanese = self.img_conf.get("video_japanese_voice", False)
@@ -423,6 +419,12 @@ class ImageService:
                 parts.append("【言語指定：日本語】この動画のすべての音声・セリフは日本語で生成してください。")
             if img_desc:
                 parts.append(img_desc)
+            # 从生活日程中提取穿搭信息
+            if life_context:
+                for line in life_context.split("\n"):
+                    if "穿搭" in line or "outfit" in line.lower():
+                        parts.append(line.strip())
+                        break
             if context_hint:
                 parts.append(context_hint)
             # 人物音色
@@ -449,6 +451,21 @@ class ImageService:
                 backend = self._aiimg_plugin.registry.get_video_backend(provider_id)
                 backend_name = type(backend).__name__
                 logger.info(f"[DailySharing] 视频后端类型: {backend_name}")
+
+                # 压缩图片到 30MB 以内（Seedance 限制）
+                if image_bytes and len(image_bytes) > 29 * 1024 * 1024:
+                    from io import BytesIO
+                    from PIL import Image
+                    img = Image.open(BytesIO(image_bytes))
+                    quality = 85
+                    while quality >= 20:
+                        buf = BytesIO()
+                        img.save(buf, format="JPEG", quality=quality)
+                        if buf.tell() <= 29 * 1024 * 1024:
+                            break
+                        quality -= 10
+                    image_bytes = buf.getvalue()
+                    logger.info(f"[DailySharing] 视频参考图已压缩: {len(image_bytes) / (1024*1024):.1f}MB (quality={quality})")
 
                 return await backend.generate_video_url(prompt=video_prompt, image_bytes=image_bytes)
             except Exception as e:
@@ -531,7 +548,7 @@ class ImageService:
         
         return []
 
-    async def _call_aiimg(self, prompt: str, use_ref: bool = False, involves_self: bool = False) -> Optional[str]:
+    async def _call_aiimg(self, prompt: str, use_ref: bool = False, involves_self: bool = False, life_context: str = None) -> Optional[str]:
         """调用底层Gitee插件"""
         self._ensure_plugin()
         if not self._aiimg_plugin:
@@ -548,14 +565,24 @@ class ImageService:
                 if ref_images:
                     logger.info(f"[DailySharing] 找到 {len(ref_images)} 张参考图，调用图生图接口")
 
-                    # 2. 根据是否涉及人物构建不同的 Prompt
+                    # 2. 从生活日程提取穿搭信息
+                    outfit_hint = ""
+                    if life_context:
+                        for line in life_context.split("\n"):
+                            if "穿搭" in line or "outfit" in line.lower():
+                                outfit_hint = line.strip()
+                                break
+
+                    # 3. 根据是否涉及人物构建不同的 Prompt
                     if involves_self:
+                        outfit_line = f"\n3) 穿搭参考：{outfit_hint}" if outfit_hint else ""
                         final_prompt = (
                             "请根据参考图生成一张新的图片：\n"
                             "1) 保持第1张参考图的人脸身份特征，保持五官/气质一致。\n"
                             "2) 保持参考图的画风和艺术风格（如二次元、写实、插画等），不要改变风格。\n"
-                            f"3) 画面具体描述：{prompt}\n"
-                            "4) 不要拼图，不要水印。"
+                            f"{outfit_line}\n"
+                            f"{'4' if outfit_hint else '3'}) 画面具体描述：{prompt}\n"
+                            f"{'5' if outfit_hint else '4'}) 不要拼图，不要水印。"
                         )
                         task_types = ["id", "background", "style"]
                     else:

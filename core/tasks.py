@@ -1,4 +1,5 @@
 import asyncio
+import os
 import random
 import re
 import sys
@@ -989,7 +990,7 @@ class TaskManager:
                 # 生成视频 (如果明确要求视频)
                 if img_path and self.image_conf.get("enable_ai_video", False):
                     if need_video:
-                        video_url = await self.image_service.generate_video_from_image(img_path, content, is_scheduled=False)
+                        video_url = await self.image_service.generate_video_from_image(img_path, content, is_scheduled=False, life_context=life_ctx)
 
             # ================= 语音生成逻辑 =================
             audio_path = None
@@ -1233,10 +1234,14 @@ class TaskManager:
                             img_path = ai_img_path
                             
                         # 尝试生成视频
-                        if img_path and self.image_conf.get("enable_ai_video", False):
-                            video_allowed = self.image_conf.get("video_enabled_types", ["greeting", "mood"])
+                        enable_video = self.image_conf.get("enable_ai_video", False)
+                        video_allowed = self.image_conf.get("video_enabled_types", ["greeting", "mood"])
+                        logger.info(f"[DailySharing] 视频检查: enable={enable_video}, img_path={bool(img_path)}, type={stype.value}, allowed={video_allowed}")
+                        if img_path and enable_video:
                             if stype.value in video_allowed:
-                                video_url = await self.image_service.generate_video_from_image(img_path, content, is_scheduled=True)
+                                video_url = await self.image_service.generate_video_from_image(img_path, content, is_scheduled=True, life_context=life_ctx)
+                            else:
+                                logger.info(f"[DailySharing] 当前类型 {stype.value} 不在视频允许列表 {video_allowed}，跳过视频")
                     else:
                          logger.info(f"[DailySharing] 当前类型 {stype.value} 不在配图允许列表，跳过配图。")
 
@@ -1366,7 +1371,7 @@ class TaskManager:
                         logger.error(f"[DailySharing] QQ空间配图生成失败: {e}")
                 else:
                     logger.info(f"[DailySharing] 当前类型 {stype.value} 不在QQ空间配图允许列表，跳过配图。")
-            
+
             # 如果是新闻类型，且没有开启画图，且配置允许附带热搜图，尝试贴热搜图
             if stype == SharingType.NEWS and not target_local_img and self.qzone_conf.get("qzone_attach_hot_news_image", True):
                 try:
