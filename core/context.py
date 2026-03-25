@@ -66,9 +66,9 @@ class ContextService:
         return self._memos_plugin
 
     def _get_tts_plugin_inst(self):
-        """获取 TTS 插件实例"""
+        """获取 TTS 插件实例（优先 my_tts，回退 tts_emotion）"""
         if not self._tts_plugin:
-            self._tts_plugin = self._find_plugin("tts_emotion")
+            self._tts_plugin = self._find_plugin("my_tts") or self._find_plugin("tts_emotion")
         return self._tts_plugin
 
     def _is_group_chat(self, target_umo: str) -> bool:
@@ -232,43 +232,41 @@ class ContextService:
         # 2. 获取插件
         tts_plugin = self._get_tts_plugin_inst()
         if not tts_plugin:
-            logger.warning("[DailySharing] 未找到 TTS 插件 (astrbot_plugin_tts_emotion_router)，无法生成语音。")
+            logger.warning("[DailySharing] 未找到 TTS 插件 (my_tts 或 tts_emotion)，无法生成语音。")
             return None
 
-        # 优先提取情感标签
+        # 提取情感标签
         target_emotion = "neutral"
-        
-        # 正则匹配 $$happy$$ 格式
         emotion_match = re.search(r'\$\$(?:EMO:)?(happy|sad|angry|neutral|surprise)\$\$', text, flags=re.IGNORECASE)
         if emotion_match:
             target_emotion = emotion_match.group(1).lower()
-            logger.debug(f"[DailySharing] 检测到内置情感标签: {target_emotion}")
-        else:
-            # 如果没有标签，再尝试使用 Agent 分析 (仅作为后备)
-            if sharing_type:
-                target_emotion = await self._agent_analyze_sentiment(text, sharing_type)
+        elif sharing_type:
+            target_emotion = await self._agent_analyze_sentiment(text, sharing_type)
 
-        # 3. 文本清洗
-        final_text = text
-        # 正则替换：彻底清洗文本中可能存在的任何标签，只保留纯文本给 TTS
-        final_text = re.sub(r'\$\$(?:EMO:)?(?:happy|sad|angry|neutral|surprise)\$\$', '', final_text, flags=re.IGNORECASE).strip()
-        
-        # 5. 调用生成
+        # 文本清洗
+        final_text = re.sub(r'\$\$(?:EMO:)?(?:happy|sad|angry|neutral|surprise)\$\$', '', text, flags=re.IGNORECASE).strip()
+
         try:
+            # 优先使用 my_tts 的公开 API
+            if type(tts_plugin).__name__ == "MyTTSPlugin" or hasattr(tts_plugin, "generate_speech"):
+                logger.info(f"[DailySharing] 使用 my_tts 生成语音: {final_text[:20]}... (情绪: {target_emotion})")
+                wav_path = await tts_plugin.generate_speech(final_text, target_emotion)
+                if wav_path:
+                    logger.info(f"[DailySharing] TTS 生成成功: {wav_path}")
+                    return str(wav_path)
+                else:
+                    logger.warning("[DailySharing] my_tts 生成失败")
+                    return None
+
+            # 回退到 tts_emotion_router 旧接口
             session_state = None
-            
             if hasattr(tts_plugin, "_get_session_state"):
                 session_state = tts_plugin._get_session_state(target_umo)
-                
-                # 注入情感
-                if target_emotion:
-                    if hasattr(session_state, "pending_emotion"):
-                        session_state.pending_emotion = target_emotion
-                        logger.debug(f"[DailySharing] TTS 注入情绪: {target_emotion}")
+                if target_emotion and hasattr(session_state, "pending_emotion"):
+                    session_state.pending_emotion = target_emotion
+                    logger.debug(f"[DailySharing] TTS 注入情绪: {target_emotion}")
 
             logger.info(f"[DailySharing] 正在请求 TTS 生成: {final_text[:20]}... (情绪: {target_emotion})")
-            
-            # 调用 TTS 处理器的 process 方法
             result = await tts_plugin.tts_processor.process(final_text, session_state)
 
             if result and result.success and result.audio_path:
@@ -297,36 +295,19 @@ class ContextService:
         if not plugin:
             return None
 
-        # 直接访问 life_scheduler 的 data_mgr 获取今日数据
+        # 调用 life_scheduler 的公开 API（内部已处理跨日回退）
         try:
-            import datetime as _dt
-            data_mgr = getattr(plugin, 'data_mgr', None)
-            if data_mgr is None:
-                logger.debug("[上下文] life_scheduler 没有 data_mgr 属性")
+            get_ctx = getattr(plugin, 'get_life_context', None)
+            if not get_ctx:
+                logger.debug("[上下文] life_scheduler 没有 get_life_context 方法，请更新插件")
                 return None
-
-            schedule_data = data_mgr.get(_dt.datetime.now())
-            if not schedule_data or schedule_data.status == "failed":
-                return None
-
-            # 将 ScheduleData 转为自然语言
-            parts = []
-            if schedule_data.outfit:
-                parts.append(f"【今日穿搭】{schedule_data.outfit}")
-            if getattr(schedule_data, 'outfit_style', ''):
-                parts.append(f"【穿搭风格】{schedule_data.outfit_style}")
-            if schedule_data.schedule:
-                parts.append(f"【今日日程】\n{schedule_data.schedule}")
-
-            if parts:
-                result = "\n".join(parts)
+            result = get_ctx()
+            if result:
                 logger.info(f"[上下文] 成功获取 life_scheduler 数据: {result[:80]}...")
-                return result
-
+            return result
         except Exception as e:
             logger.warning(f"[上下文] Life Scheduler 数据读取出错: {e}")
-
-        return None
+            return None
 
     def _parse_life_data(self, data: dict) -> str:
         """解析 Life Scheduler 返回的 JSON 数据为自然语言"""
